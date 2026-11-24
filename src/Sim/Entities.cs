@@ -31,6 +31,9 @@ public sealed class PlayerSlot
     /// <summary>Desired movement in world space, length &lt;= 1. Set by keyboard, bot or network.</summary>
     public Vector2 Intent;
 
+    /// <summary>Online only: where the remote player's own client shows the paddle. Overrides <see cref="Intent"/>.</summary>
+    public float? TargetLateral;
+
     internal float BotError;
     internal float BotTimer;
 

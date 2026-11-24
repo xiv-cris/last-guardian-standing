@@ -19,6 +19,7 @@ public sealed class Simulation
     public const int ChaosStartBalls = 3;
     const float AntiStallMinComponent = 0.22f;
     const float WallMinAlong = 0.45f;   // ~27 degrees off the wall normal, at least
+    const float RemoteCatchUp = 1.5f;   // remote paddles may chase their reported position at 1.5x paddle speed
 
     public MatchConfig Config { get; }
     public TeamLayout ResolvedLayout { get; }
@@ -29,6 +30,8 @@ public sealed class Simulation
     /// <summary>Things that happened during the last <see cref="Step"/>. Cleared at the start of each step.</summary>
     public List<SimEvent> Events { get; } = new();
 
+    /// <summary>Number of <see cref="Step"/> calls so far.</summary>
+    public int Tick { get; private set; }
     public MatchPhase Phase { get; private set; }
     public float PhaseTimer { get; private set; }
     public int Round { get; private set; }
@@ -74,8 +77,35 @@ public sealed class Simulation
         Players[(int)side].Intent = intent;
     }
 
+    /// <summary>
+    /// For remote players: the paddle position their own client shows. The paddle chases it (speed-limited),
+    /// so what a player sees locally is what the host plays with.
+    /// </summary>
+    public void SetTargetLateral(GoalSide side, float lateral)
+    {
+        if (!float.IsFinite(lateral)) return;
+        Players[(int)side].TargetLateral = Math.Clamp(lateral, -Arena.PaddleLateralLimit, Arena.PaddleLateralLimit);
+    }
+
+    /// <summary>Hands a side over to a bot, e.g. when its player disconnects mid-match.</summary>
+    public void ConvertToBot(GoalSide side)
+    {
+        var p = Players[(int)side];
+        if (p.Kind == ControllerKind.Empty) return;
+        p.Kind = ControllerKind.Bot;
+        p.TargetLateral = null;
+    }
+
+    /// <summary>One paddle movement step from an intent. Shared with clients so their own paddle predicts exactly.</summary>
+    public static float StepLateral(GoalSide side, float lateral, Vector2 intent, float h)
+    {
+        float input = Math.Clamp(Vector2.Dot(intent, Arena.Tangent(side)), -1f, 1f);
+        return Math.Clamp(lateral + input * Arena.PaddleSpeed * h, -Arena.PaddleLateralLimit, Arena.PaddleLateralLimit);
+    }
+
     public void Step(float dt)
     {
+        Tick++;
         Events.Clear();
 
         foreach (var p in Players)
@@ -122,6 +152,7 @@ public sealed class Simulation
             p.Eliminated = p.Kind == ControllerKind.Empty;
             p.Lives = Config.Lives;
             p.Lateral = p.LateralVelocity = 0f;
+            p.TargetLateral = null;
         }
 
         foreach (var t in Teams)
@@ -288,9 +319,17 @@ public sealed class Simulation
         foreach (var p in Players)
         {
             if (!p.IsActive) continue;
-            // Only the component of the intent along the goal line matters.
-            float lat = Math.Clamp(Vector2.Dot(p.Intent, Arena.Tangent(p.Side)), -1f, 1f);
-            float newLat = Math.Clamp(p.Lateral + lat * Arena.PaddleSpeed * h, -Arena.PaddleLateralLimit, Arena.PaddleLateralLimit);
+
+            float newLat;
+            if (p.TargetLateral is float target)
+            {
+                float maxStep = Arena.PaddleSpeed * RemoteCatchUp * h;
+                newLat = p.Lateral + Math.Clamp(target - p.Lateral, -maxStep, maxStep);
+            }
+            else
+            {
+                newLat = StepLateral(p.Side, p.Lateral, p.Intent, h);
+            }
 
             p.LateralVelocity = (newLat - p.Lateral) / h;
             p.Lateral = newLat;
