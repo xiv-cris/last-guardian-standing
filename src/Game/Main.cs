@@ -12,7 +12,7 @@ namespace LastGuardianStanding.Game;
 /// <summary>
 /// Glue between menus, the simulation, the network and the view. Three ways to play:
 /// <list type="bullet">
-/// <item>Local: one keyboard, everything runs here.</item>
+/// <item>Local: one keyboard (and gamepads), everything runs here.</item>
 /// <item>Host: runs the real simulation, applies remote players' paddles, broadcasts snapshots.</item>
 /// <item>Client: sends its own paddle position, draws the host's snapshots (smoothed).</item>
 /// </list>
@@ -21,28 +21,23 @@ public partial class Main : Node2D
 {
     enum Mode { Menu, Local, Host, Client }
 
-    static readonly string[] KeyHints = { "W A S D", "Numpad 8 4 5 6", "Arrow keys", "I J K L" };
-
-    // up, left, down, right — screen directions, which are also world directions in local play.
-    static readonly Key[][] SideKeys =
-    {
-        new[] { Key.W, Key.A, Key.S, Key.D },
-        new[] { Key.Kp8, Key.Kp4, Key.Kp5, Key.Kp6 },
-        new[] { Key.Up, Key.Left, Key.Down, Key.Right },
-        new[] { Key.I, Key.J, Key.K, Key.L },
-    };
-
     Mode _mode = Mode.Menu;
     bool _inMatch;
     ArenaView _view = null!;
     MenuUI _menu = null!;
     NetSession _net = null!;
     MatchOverlay _overlay = null!;
+    Sfx _sfx = null!;
+    Music _music = null!;
+    bool _paused;
     Camera2D _camera = null!;
 
     /// <summary>Active touches (and mouse drags, emulated as touch), by finger index, in screen pixels.</summary>
     readonly Dictionary<int, Vector2> _touches = new();
     Vector2I _lastWindowSize;
+
+    /// <summary>Gamepad device per side in local play (-1 = keyboard only).</summary>
+    int[] _localPads = { -1, -1, -1, -1 };
 
     readonly MatchConfig _localConfig = new();
     Simulation? _sim;
@@ -66,17 +61,26 @@ public partial class Main : Node2D
 
     public override void _Ready()
     {
+        Controls.Load();
+        Controls.AddGamepadMenuButtons();
+        Input.JoyConnectionChanged += OnJoyConnectionChanged;
+
         _view = new ArenaView { Name = "ArenaView" };
         AddChild(_view);
         _net = new NetSession { Name = "NetSession" };
         AddChild(_net);
         _overlay = new MatchOverlay { Name = "MatchOverlay", Visible = false };
         AddChild(_overlay);
+        _sfx = new Sfx { Name = "Sfx" };
+        AddChild(_sfx);
+        _music = new Music { Name = "Music" };
+        AddChild(_music);
         _menu = new MenuUI { Name = "Menu" };
         AddChild(_menu);
         _camera = GetNode<Camera2D>("Camera2D");
 
         _overlay.ExitPressed += ExitMatch;
+        _overlay.PausePressed += TogglePause;
         _overlay.MenuPressed += ExitMatch;
         _overlay.RematchPressed += Rematch;
 
@@ -87,6 +91,7 @@ public partial class Main : Node2D
         _menu.BackPressed += OnBackPressed;
         _menu.SettingsEdited += OnLobbySettingsEdited;
         _menu.SlotEdited += OnLobbySlotEdited;
+        _menu.MusicToggled += on => _music.Enabled = on;
 
         _net.ConnectedToHost += () => _net.SendHello(_menu.PlayerName);
         _net.Disconnected += reason => LeaveOnline(reason);
@@ -98,6 +103,7 @@ public partial class Main : Node2D
         _net.PeerLeft += OnPeerLeft;
         _net.InputReceived += OnRemoteInput;
 
+        _menu.SetMusic(_music.Enabled);
         _menu.ShowMain();
         HandleCommandLine();
     }
@@ -109,13 +115,13 @@ public partial class Main : Node2D
         float dt = (float)delta;
         switch (_mode)
         {
-            case Mode.Local when _sim != null:
+            case Mode.Local when _sim != null && !_paused:
                 var touchIntents = LocalTouchIntents(_sim);
                 for (int i = 0; i < 4; i++)
                     if (_sim.Players[i].Kind == ControllerKind.Human)
-                        _sim.SetIntent((GoalSide)i, touchIntents[i] ?? ReadSideKeys(i));
+                        _sim.SetIntent((GoalSide)i, touchIntents[i] ?? ToNVec(Controls.LocalIntent(i, _localPads[i])));
                 _sim.Step(dt);
-                _view.OnEvents(_sim.Events);
+                PlayEvents(_sim.Events);
                 _state = GameState.Capture(_sim, _matchId, _sim.Events);
                 break;
 
@@ -123,7 +129,7 @@ public partial class Main : Node2D
                 if (_mySide >= 0)
                     _sim.SetIntent((GoalSide)_mySide, OnlineIntent(_sim.Players[_mySide].Lateral));
                 _sim.Step(dt);
-                _view.OnEvents(_sim.Events);
+                PlayEvents(_sim.Events);
                 _pendingEvents.AddRange(_sim.Events);
                 _state = GameState.Capture(_sim, _matchId, _sim.Events);
 
@@ -160,7 +166,7 @@ public partial class Main : Node2D
             var s = _buffer.Sample();
             if (s != null)
             {
-                _view.OnEvents(_buffer.TakeDueEvents());
+                PlayEvents(_buffer.TakeDueEvents());
                 // Our own paddle is drawn where we put it, not where the (slightly old) snapshot says.
                 if (_mySide >= 0 && s.Players[_mySide].IsActive)
                     s.Players[_mySide].Lateral = _myLateral;
@@ -171,9 +177,9 @@ public partial class Main : Node2D
         _view.State = _state;
         UpdateLayout();
 
-        bool playing = _mode == Mode.Local ? _sim != null : _inMatch;
+        bool playing = IsPlaying;
         _overlay.Visible = playing;
-        _overlay.SetMatchOver(playing && _state?.Phase == MatchPhase.MatchOver);
+        _overlay.SetMatchOver(playing && _state?.Phase == MatchPhase.MatchOver, _paused);
         if (!playing) _touches.Clear();
 
         if (_autostartAt >= 0 && _uptime >= _autostartAt && _mode == Mode.Host && !_inMatch)
@@ -199,6 +205,14 @@ public partial class Main : Node2D
 
     public override void _UnhandledInput(InputEvent @event)
     {
+        // Menus: Esc / gamepad B (Circle) goes back a screen. (The controls screen eats Esc while waiting for a key.)
+        if (!IsPlaying && _menu.Visible && @event.IsActionPressed("ui_cancel"))
+        {
+            MenuBack(quitFromMain: false);
+            GetViewport().SetInputAsHandled();
+            return;
+        }
+
         switch (@event)
         {
             case InputEventScreenTouch { Pressed: true } touch:
@@ -208,25 +222,76 @@ public partial class Main : Node2D
                 _touches[drag.Index] = drag.Position;
                 return;
             case InputEventKey { Pressed: true, Echo: false } key:
+                if (!IsPlaying) return;
                 bool matchOver = _state?.Phase == MatchPhase.MatchOver;
-                bool playing = _mode == Mode.Local ? _sim != null : _inMatch;
-                if (!playing) return;
-                if (key.Keycode == Key.Escape) ExitMatch();
-                else if (matchOver && key.Keycode == Key.Space && _mode != Mode.Client) ExitMatch();
-                else if (matchOver && key.Keycode == Key.R) Rematch();
+                if (Controls.Matches(Controls.Exit, key)) ExitMatch();
+                else if (!matchOver && Controls.Matches(Controls.Pause, key)) TogglePause();
+                else if (matchOver && Controls.Matches(Controls.Menu, key) && _mode != Mode.Client) ExitMatch();
+                else if (matchOver && Controls.Matches(Controls.Rematch, key)) Rematch();
+                return;
+            case InputEventJoypadButton { Pressed: true } button:
+                if (!IsPlaying) return;
+                bool over = _state?.Phase == MatchPhase.MatchOver;
+                if (button.ButtonIndex == JoyButton.Back) ExitMatch();
+                else if (over && button.ButtonIndex == JoyButton.B && _mode != Mode.Client) ExitMatch();
+                else if (button.ButtonIndex == JoyButton.Start)
+                {
+                    if (over) Rematch();
+                    else TogglePause();
+                }
                 return;
         }
     }
+
+    bool IsPlaying => _mode == Mode.Local ? _sim != null : _inMatch;
 
     /// <summary>Android back button / gesture: behaves like Esc, and quits from the main screen.</summary>
     public override void _Notification(int what)
     {
         if (what != NotificationWMGoBackRequest) return;
-        bool playing = _mode == Mode.Local ? _sim != null : _inMatch;
-        if (playing) ExitMatch();
-        else if (_menu.IsOnMainScreen) GetTree().Quit();
+        if (IsPlaying) ExitMatch();
+        else MenuBack(quitFromMain: true);
+    }
+
+    /// <summary>Back one menu screen: controls -> main, setup -> main, lobby -> leave.</summary>
+    void MenuBack(bool quitFromMain)
+    {
+        if (_menu.IsOnMainScreen)
+        {
+            if (quitFromMain) GetTree().Quit();
+        }
+        else if (_menu.IsOnControlsScreen) _menu.ShowMain();
         else OnBackPressed();
     }
+
+    /// <summary>Local matches only: online games keep running for everyone else.</summary>
+    void TogglePause()
+    {
+        if (_mode != Mode.Local || _sim == null || _state?.Phase == MatchPhase.MatchOver) return;
+        SetPaused(!_paused);
+    }
+
+    void SetPaused(bool paused)
+    {
+        _paused = paused;
+        _view.PausedHint = paused ? $"{Controls.KeysText(Controls.Pause)} / Start: resume     {Controls.KeysText(Controls.Exit)}: menu" : null;
+    }
+
+    void PlayEvents(List<SimEvent> events)
+    {
+        _view.OnEvents(events);
+        _sfx.OnEvents(events);
+    }
+
+    public override void _ExitTree() => Input.JoyConnectionChanged -= OnJoyConnectionChanged;
+
+    /// <summary>A gamepad was plugged in or out: hand pads out again and update the side labels.</summary>
+    void OnJoyConnectionChanged(long device, bool connected)
+    {
+        if (_mode == Mode.Local && _sim != null) AssignLocalPads();
+    }
+
+    static NVec ToNVec(Vector2 v) => new(v.X, v.Y);
 
     /// <summary>Esc / Exit button: local -> setup, host -> lobby for everyone, client -> leave.</summary>
     void ExitMatch()
@@ -318,21 +383,10 @@ public partial class Main : Node2D
         _view.Portrait = portrait;
     }
 
-    NVec ReadSideKeys(int side)
-    {
-        var k = SideKeys[side];
-        float x = (Input.IsPhysicalKeyPressed(k[3]) ? 1 : 0) - (Input.IsPhysicalKeyPressed(k[1]) ? 1 : 0);
-        float y = (Input.IsPhysicalKeyPressed(k[2]) ? 1 : 0) - (Input.IsPhysicalKeyPressed(k[0]) ? 1 : 0);
-        return new NVec(x, y);
-    }
-
     /// <summary>Online, everyone's goal is at the bottom: left/right on screen, turned back into world space.</summary>
     NVec ReadOnlineIntent()
     {
-        float x = 0f;
-        if (Input.IsPhysicalKeyPressed(Key.Left) || Input.IsPhysicalKeyPressed(Key.A)) x -= 1f;
-        if (Input.IsPhysicalKeyPressed(Key.Right) || Input.IsPhysicalKeyPressed(Key.D)) x += 1f;
-        var world = new Vector2(x, 0f).Rotated(-_view.ViewRotation);
+        var world = new Vector2(Controls.OnlineAxis(), 0f).Rotated(-_view.ViewRotation);
         return new NVec(world.X, world.Y);
     }
 
@@ -368,26 +422,38 @@ public partial class Main : Node2D
     {
         _mode = Mode.Local;
         _sim = new Simulation(_localConfig);
+        SetPaused(false);
         _matchId++;
         _state = null;
 
         _view.ViewRotation = 0f;
         _view.MySide = -1;
         for (int i = 0; i < 4; i++)
+            _view.DisplayNames[i] = ArenaView.SideNames[i];
+        AssignLocalPads();
+        _view.MatchOverHint = $"{Controls.KeysText(Controls.Menu)}: menu     {Controls.KeysText(Controls.Rematch)}: rematch";
+        _view.ResetEffects();
+        _overlay.Configure("Menu", "Menu", hostControls: true, canPause: true);
+        HideMenu();
+    }
+
+    /// <summary>Gives gamepads to local sides and labels each side with its keys / pad.</summary>
+    void AssignLocalPads()
+    {
+        _localPads = Controls.ResolveLocalPads(i => _localConfig.Slots[i] == ControllerKind.Human);
+        for (int i = 0; i < 4; i++)
         {
+            string controls = Controls.LocalKeysHint(i);
+            if (_localPads[i] >= 0) controls += " + " + Controls.PadName(_localPads[i]);
             _view.SideLabels[i] = _localConfig.Slots[i] == ControllerKind.Bot
                 ? $"{ArenaView.SideNames[i]} · BOT"
-                : $"{ArenaView.SideNames[i]} · {KeyHints[i]}";
-            _view.DisplayNames[i] = ArenaView.SideNames[i];
+                : $"{ArenaView.SideNames[i]} · {controls}";
         }
-        _view.MatchOverHint = "Space: menu     R: rematch";
-        _view.ResetEffects();
-        _overlay.Configure("Menu", "Menu", hostControls: true);
-        HideMenu();
     }
 
     void StopLocal()
     {
+        SetPaused(false);
         _sim = null;
         _state = null;
         _menu.ShowLocalSetup(_localConfig);
@@ -609,10 +675,12 @@ public partial class Main : Node2D
             _view.DisplayNames[i] = name;
             _view.SideLabels[i] = owner > 0 ? (owner == me ? $"{name} (you)" : name) : "BOT";
         }
-        _view.MatchOverHint = _mode == Mode.Host ? "Space: lobby     R: rematch" : "Waiting for the host…";
+        _view.MatchOverHint = _mode == Mode.Host
+            ? $"{Controls.KeysText(Controls.Menu)}: lobby     {Controls.KeysText(Controls.Rematch)}: rematch"
+            : "Waiting for the host…";
         if (resetEffects) _view.ResetEffects();
-        if (_mode == Mode.Host) _overlay.Configure("Lobby", "Lobby", hostControls: true);
-        else _overlay.Configure("Leave", "", hostControls: false);
+        if (_mode == Mode.Host) _overlay.Configure("Lobby", "Lobby", hostControls: true, canPause: false);
+        else _overlay.Configure("Leave", "", hostControls: false, canPause: false);
     }
 
     /// <summary>Rotation that puts <paramref name="side"/>'s goal at the bottom of the screen.</summary>
@@ -634,7 +702,7 @@ public partial class Main : Node2D
 
     /// <summary>
     /// Options after "--" on the command line, mainly for testing:
-    /// --demo, --name N, --port P, --host, --join ADDRESS, --autostart SECONDS, --screenshot PATH, --screenshot-at SECONDS
+    /// --demo, --controls, --name N, --port P, --host, --join ADDRESS, --autostart SECONDS, --screenshot PATH, --screenshot-at SECONDS
     /// </summary>
     void HandleCommandLine()
     {
@@ -656,7 +724,11 @@ public partial class Main : Node2D
         }
         if (Arg("--autostart") is { } auto) _autostartAt = Seconds(auto, 3);
 
-        if (args.Contains("--demo"))
+        if (args.Contains("--controls"))
+        {
+            _menu.ShowControls();
+        }
+        else if (args.Contains("--demo"))
         {
             for (int i = 0; i < 4; i++) _localConfig.Slots[i] = ControllerKind.Bot;
             _localConfig.BallMode = BallMode.Chaos;

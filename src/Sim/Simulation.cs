@@ -274,6 +274,7 @@ public sealed class Simulation
             Vel = Rotate(toCenter, spread) * Arena.BallStartSpeed,
             SpawnTimer = Config.BallMode == BallMode.Single ? SingleSpawnDelay : ChaosSpawnDelay,
         });
+        Events.Add(new SimEvent(SimEventType.BallSpawned, Pos: Balls[^1].Pos));
     }
 
     // ---------------------------------------------------------------- physics

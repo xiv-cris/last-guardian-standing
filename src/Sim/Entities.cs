@@ -61,6 +61,7 @@ public enum SimEventType
     TeamEliminated,
     RoundWon,
     MatchWon,
+    BallSpawned, // appended last: older builds ignore event types they don't know
 }
 
 public readonly record struct SimEvent(SimEventType Type, GoalSide? Side = null, int Team = -1, Vector2 Pos = default);

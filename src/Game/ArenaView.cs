@@ -39,6 +39,9 @@ public partial class ArenaView : Node2D
 
     public string MatchOverHint { get; set; } = "";
 
+    /// <summary>Non-null while a local match is paused: drawn under "PAUSED".</summary>
+    public string? PausedHint { get; set; }
+
     /// <summary>Tall screen: scoreboard goes above the arena, side labels squeeze in.</summary>
     public bool Portrait { get; set; }
 
@@ -311,6 +314,12 @@ public partial class ArenaView : Node2D
                 DrawBig($"{TeamLabel(s, s.MatchWinner)} wins the match!", -20, 46, Glow(TeamColor(s.MatchWinner), 1.6f));
                 DrawBig(MatchOverHint, 30, 22, new Color(1, 1, 1, 0.8f));
                 break;
+        }
+
+        if (PausedHint != null)
+        {
+            DrawBig("PAUSED", 120, 56, Glow(Colors.White, 1.4f));
+            DrawBig(PausedHint, 165, 22, new Color(1, 1, 1, 0.8f));
         }
     }
 
