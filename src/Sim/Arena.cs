@@ -45,12 +45,15 @@ public static class Arena
     public static Vector2 LineCenter(GoalSide side) => -Inward(side) * Half;
 
     /// <summary>Axis-aligned box of a paddle: center and half extents.</summary>
-    public static void PaddleBox(PlayerSlot p, out Vector2 center, out Vector2 halfExtents)
+    public static void PaddleBox(PlayerSlot p, out Vector2 center, out Vector2 halfExtents) =>
+        PaddleBox(p.Side, p.Lateral, out center, out halfExtents);
+
+    public static void PaddleBox(GoalSide side, float lateral, out Vector2 center, out Vector2 halfExtents)
     {
-        center = LineCenter(p.Side)
-                 + Inward(p.Side) * (PaddleThickness / 2f)
-                 + Tangent(p.Side) * p.Lateral;
-        halfExtents = p.Side is GoalSide.North or GoalSide.South
+        center = LineCenter(side)
+                 + Inward(side) * (PaddleThickness / 2f)
+                 + Tangent(side) * lateral;
+        halfExtents = side is GoalSide.North or GoalSide.South
             ? new Vector2(PaddleLength / 2f, PaddleThickness / 2f)
             : new Vector2(PaddleThickness / 2f, PaddleLength / 2f);
     }

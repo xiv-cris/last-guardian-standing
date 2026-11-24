@@ -1,26 +1,29 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using Godot;
+using LastGuardianStanding.Net;
 using LastGuardianStanding.Sim;
 using NVec = System.Numerics.Vector2;
 
 namespace LastGuardianStanding.Game;
 
 /// <summary>
-/// Local prototype front-end: owns a <see cref="Simulation"/>, feeds it keyboard input, and draws it.
+/// Glue between menus, the simulation, the network and the view. Three ways to play:
+/// <list type="bullet">
+/// <item>Local: one keyboard, everything runs here.</item>
+/// <item>Host: runs the real simulation, applies remote players' paddles, broadcasts snapshots.</item>
+/// <item>Client: sends its own paddle position, draws the host's snapshots (smoothed).</item>
+/// </list>
 /// </summary>
 public partial class Main : Node2D
 {
-    static readonly Color[] TeamColors =
-    {
-        new(0.25f, 0.9f, 1f), new(1f, 0.3f, 0.75f), new(0.55f, 1f, 0.3f), new(1f, 0.65f, 0.2f),
-    };
-    static readonly string[] TeamNames = { "Cyan", "Magenta", "Lime", "Amber" };
-    static readonly string[] SideNames = { "North", "East", "South", "West" };
+    enum Mode { Menu, Local, Host, Client }
+
     static readonly string[] KeyHints = { "W A S D", "Numpad 8 4 5 6", "Arrow keys", "I J K L" };
 
-    // up, left, down, right — screen directions, which are also world directions.
+    // up, left, down, right — screen directions, which are also world directions in local play.
     static readonly Key[][] SideKeys =
     {
         new[] { Key.W, Key.A, Key.S, Key.D },
@@ -29,87 +32,168 @@ public partial class Main : Node2D
         new[] { Key.I, Key.J, Key.K, Key.L },
     };
 
-    const int TrailLength = 14;
+    Mode _mode = Mode.Menu;
+    bool _inMatch;
+    ArenaView _view = null!;
+    MenuUI _menu = null!;
+    NetSession _net = null!;
 
+    readonly MatchConfig _localConfig = new();
     Simulation? _sim;
-    readonly MatchConfig _config = new();
-    Camera2D _camera = null!;
-    Vector2[] _arenaPolygon = Array.Empty<Vector2>();
-    readonly Dictionary<int, List<Vector2>> _trails = new();
-    readonly float[] _goalFlash = new float[4];
-    float _shake;
-    float _time;
-    Font _font = null!;
+    GameState? _state;
+    int _matchId;
 
-    // Menu
-    CanvasLayer _menuLayer = null!;
-    OptionButton _teamMode = null!, _layout = null!, _livesMode = null!, _ballMode = null!;
-    SpinBox _lives = null!, _rounds = null!, _maxBalls = null!;
-    readonly OptionButton[] _slots = new OptionButton[4];
+    // Online
+    LobbyState _lobby = new();
+    readonly List<SimEvent> _pendingEvents = new();
+    readonly SnapshotBuffer _buffer = new();
+    int _mySide = -1;
+    float _myLateral;
+    int _myRound = -1;
+    int _tickCounter;
+
+    // Command-line helpers (testing)
+    double _uptime;
+    double _autostartAt = -1;
+    string? _screenshotPath;
+    double _screenshotAt = -1;
 
     public override void _Ready()
     {
-        _camera = GetNode<Camera2D>("Camera2D");
-        _font = ThemeDB.FallbackFont;
-        _arenaPolygon = BuildArenaPolygon();
-        BuildMenu();
+        _view = new ArenaView { Name = "ArenaView" };
+        AddChild(_view);
+        _net = new NetSession { Name = "NetSession" };
+        AddChild(_net);
+        _menu = new MenuUI { Name = "Menu" };
+        AddChild(_menu);
 
-        // `godot -- --demo` starts an all-bot chaos match straight away (handy for testing).
-        if (OS.GetCmdlineUserArgs().Contains("--demo"))
-        {
-            for (int i = 0; i < 4; i++) _config.Slots[i] = ControllerKind.Bot;
-            _config.BallMode = BallMode.Chaos;
-            _config.TeamMode = TeamMode.TwoVsTwo;
-            StartMatch(fromMenu: false);
-        }
+        _menu.LocalPressed += () => { _mode = Mode.Local; _menu.ShowLocalSetup(_localConfig); };
+        _menu.HostPressed += HostGame;
+        _menu.JoinPressed += JoinGame;
+        _menu.StartPressed += OnStartPressed;
+        _menu.BackPressed += OnBackPressed;
+        _menu.SettingsEdited += OnLobbySettingsEdited;
+        _menu.SlotEdited += OnLobbySlotEdited;
+
+        _net.ConnectedToHost += () => _net.SendHello(_menu.PlayerName);
+        _net.Disconnected += reason => LeaveOnline(reason);
+        _net.LobbyReceived += OnLobbyReceived;
+        _net.MatchStartReceived += id => EnterClientMatch(id);
+        _net.ReturnToLobbyReceived += OnReturnToLobbyReceived;
+        _net.SnapshotReceived += OnSnapshotReceived;
+        _net.HelloReceived += OnHello;
+        _net.PeerLeft += OnPeerLeft;
+        _net.InputReceived += OnRemoteInput;
+
+        _menu.ShowMain();
+        HandleCommandLine();
     }
 
     // ------------------------------------------------------------------ loop
 
     public override void _PhysicsProcess(double delta)
     {
-        if (_sim == null) return;
+        float dt = (float)delta;
+        switch (_mode)
+        {
+            case Mode.Local when _sim != null:
+                for (int i = 0; i < 4; i++)
+                    if (_sim.Players[i].Kind == ControllerKind.Human)
+                        _sim.SetIntent((GoalSide)i, ReadSideKeys(i));
+                _sim.Step(dt);
+                _view.OnEvents(_sim.Events);
+                _state = GameState.Capture(_sim, _matchId, _sim.Events);
+                break;
 
-        for (int i = 0; i < 4; i++)
-            if (_sim.Players[i].Kind == ControllerKind.Human)
-                _sim.SetIntent((GoalSide)i, ReadKeys(i));
+            case Mode.Host when _inMatch && _sim != null:
+                if (_mySide >= 0)
+                    _sim.SetIntent((GoalSide)_mySide, ReadOnlineIntent());
+                _sim.Step(dt);
+                _view.OnEvents(_sim.Events);
+                _pendingEvents.AddRange(_sim.Events);
+                _state = GameState.Capture(_sim, _matchId, _sim.Events);
 
-        _sim.Step((float)delta);
-        HandleEvents(_sim.Events);
-        UpdateTrails();
+                if (++_tickCounter % Protocol.SnapshotEveryTicks == 0)
+                {
+                    _net.SendSnapshot(GameState.Capture(_sim, _matchId, _pendingEvents).Serialize());
+                    _pendingEvents.Clear();
+                }
+                break;
+
+            case Mode.Client when _inMatch:
+                var latest = _buffer.Latest;
+                if (latest == null) break;
+                if (latest.Round != _myRound)
+                {
+                    _myRound = latest.Round;
+                    _myLateral = 0f; // the host recenters paddles every round
+                }
+                if (_mySide >= 0 && latest.Players[_mySide].IsActive)
+                    _myLateral = Simulation.StepLateral((GoalSide)_mySide, _myLateral, ReadOnlineIntent(), dt);
+                if (++_tickCounter % Protocol.SnapshotEveryTicks == 0 && _mySide >= 0)
+                    _net.SendInput(_myLateral);
+                break;
+        }
     }
 
     public override void _Process(double delta)
     {
-        float dt = (float)delta;
-        _time += dt;
-        for (int i = 0; i < 4; i++)
-            _goalFlash[i] = MathF.Max(0f, _goalFlash[i] - dt);
+        _uptime += delta;
 
-        _shake = MathF.Max(0f, _shake - dt * 40f);
-        _camera.Offset = _shake > 0f
-            ? new Vector2((float)GD.RandRange(-_shake, _shake), (float)GD.RandRange(-_shake, _shake))
-            : Vector2.Zero;
+        if (_mode == Mode.Client && _inMatch)
+        {
+            _buffer.Advance(delta);
+            var s = _buffer.Sample();
+            if (s != null)
+            {
+                _view.OnEvents(_buffer.TakeDueEvents());
+                // Our own paddle is drawn where we put it, not where the (slightly old) snapshot says.
+                if (_mySide >= 0 && s.Players[_mySide].IsActive)
+                    s.Players[_mySide].Lateral = _myLateral;
+                _state = s;
+            }
+        }
 
-        QueueRedraw();
+        _view.State = _state;
+
+        if (_autostartAt >= 0 && _uptime >= _autostartAt && _mode == Mode.Host && !_inMatch)
+        {
+            _autostartAt = -1;
+            StartOnlineMatch();
+        }
+
+        if (_screenshotPath != null && _uptime >= _screenshotAt)
+        {
+            GetViewport().GetTexture().GetImage().SavePng(_screenshotPath);
+            _screenshotPath = null;
+            GetTree().Quit();
+        }
     }
 
     public override void _UnhandledInput(InputEvent @event)
     {
         if (@event is not InputEventKey { Pressed: true, Echo: false } key) return;
+        bool matchOver = _state?.Phase == MatchPhase.MatchOver;
 
-        if (key.Keycode == Key.Escape && _sim != null)
+        switch (_mode)
         {
-            ShowMenu();
-        }
-        else if (_sim?.Phase == MatchPhase.MatchOver)
-        {
-            if (key.Keycode == Key.Space) ShowMenu();
-            else if (key.Keycode == Key.R) StartMatch(fromMenu: false);
+            case Mode.Local when _sim != null:
+                if (key.Keycode == Key.Escape || (matchOver && key.Keycode == Key.Space)) StopLocal();
+                else if (matchOver && key.Keycode == Key.R) StartLocal();
+                break;
+
+            case Mode.Host when _inMatch:
+                if (key.Keycode == Key.Escape || (matchOver && key.Keycode == Key.Space)) ReturnToLobby();
+                else if (matchOver && key.Keycode == Key.R) StartOnlineMatch();
+                break;
+
+            case Mode.Client when _inMatch:
+                if (key.Keycode == Key.Escape) LeaveOnline("You left the game.");
+                break;
         }
     }
 
-    static NVec ReadKeys(int side)
+    NVec ReadSideKeys(int side)
     {
         var k = SideKeys[side];
         float x = (Input.IsPhysicalKeyPressed(k[3]) ? 1 : 0) - (Input.IsPhysicalKeyPressed(k[1]) ? 1 : 0);
@@ -117,407 +201,348 @@ public partial class Main : Node2D
         return new NVec(x, y);
     }
 
-    void HandleEvents(List<SimEvent> events)
+    /// <summary>Online, everyone's goal is at the bottom: left/right on screen, turned back into world space.</summary>
+    NVec ReadOnlineIntent()
     {
-        foreach (var e in events)
+        float x = 0f;
+        if (Input.IsPhysicalKeyPressed(Key.Left) || Input.IsPhysicalKeyPressed(Key.A)) x -= 1f;
+        if (Input.IsPhysicalKeyPressed(Key.Right) || Input.IsPhysicalKeyPressed(Key.D)) x += 1f;
+        var world = new Vector2(x, 0f).Rotated(-_view.ViewRotation);
+        return new NVec(world.X, world.Y);
+    }
+
+    // ------------------------------------------------------------------ local play
+
+    void OnStartPressed()
+    {
+        if (_mode == Mode.Local)
         {
-            switch (e.Type)
-            {
-                case SimEventType.Goal:
-                    _goalFlash[(int)e.Side!.Value] = 0.6f;
-                    _shake = MathF.Max(_shake, 14f);
-                    break;
-                case SimEventType.PlayerEliminated:
-                    _shake = MathF.Max(_shake, 22f);
-                    break;
-                case SimEventType.PaddleHit:
-                    _shake = MathF.Max(_shake, 2.5f);
-                    break;
-            }
+            _menu.ReadLocalConfig(_localConfig);
+            StartLocal();
+        }
+        else if (_mode == Mode.Host)
+        {
+            StartOnlineMatch();
         }
     }
 
-    void UpdateTrails()
+    void OnBackPressed()
     {
-        var live = new HashSet<int>();
-        foreach (var b in _sim!.Balls)
+        if (_mode == Mode.Local)
         {
-            if (!b.IsLive) continue;
-            live.Add(b.Id);
-            if (!_trails.TryGetValue(b.Id, out var list))
-                _trails[b.Id] = list = new List<Vector2>();
-            list.Add(G(b.Pos));
-            if (list.Count > TrailLength) list.RemoveAt(0);
+            _mode = Mode.Menu;
+            _menu.ShowMain();
         }
-        foreach (var id in _trails.Keys.Where(id => !live.Contains(id)).ToList())
-            _trails.Remove(id);
+        else
+        {
+            LeaveOnline("");
+        }
     }
 
-    // ------------------------------------------------------------------ match / menu
-
-    void StartMatch(bool fromMenu)
+    void StartLocal()
     {
-        if (fromMenu)
-        {
-            _config.TeamMode = (TeamMode)_teamMode.Selected;
-            _config.Layout = (TeamLayout)_layout.Selected;
-            _config.LivesMode = (LivesMode)_livesMode.Selected;
-            _config.BallMode = (BallMode)_ballMode.Selected;
-            _config.Lives = (int)_lives.Value;
-            _config.RoundsToWin = (int)_rounds.Value;
-            _config.MaxBalls = (int)_maxBalls.Value;
-            for (int i = 0; i < 4; i++)
-                _config.Slots[i] = (ControllerKind)_slots[i].Selected;
-        }
+        _mode = Mode.Local;
+        _sim = new Simulation(_localConfig);
+        _matchId++;
+        _state = null;
 
-        _sim = new Simulation(_config);
-        _trails.Clear();
-        _menuLayer.Visible = false;
+        _view.ViewRotation = 0f;
+        _view.MySide = -1;
+        for (int i = 0; i < 4; i++)
+        {
+            _view.SideLabels[i] = _localConfig.Slots[i] == ControllerKind.Bot
+                ? $"{ArenaView.SideNames[i]} · BOT"
+                : $"{ArenaView.SideNames[i]} · {KeyHints[i]}";
+            _view.DisplayNames[i] = ArenaView.SideNames[i];
+        }
+        _view.MatchOverHint = "Space: menu     R: rematch";
+        _view.ResetEffects();
+        HideMenu();
     }
 
-    void ShowMenu()
+    void StopLocal()
     {
         _sim = null;
-        _trails.Clear();
-        _menuLayer.Visible = true;
+        _state = null;
+        _menu.ShowLocalSetup(_localConfig);
     }
 
-    void BuildMenu()
+    // ------------------------------------------------------------------ hosting
+
+    void HostGame()
     {
-        _menuLayer = new CanvasLayer();
-        AddChild(_menuLayer);
-
-        var dim = new ColorRect { Color = new Color(0, 0, 0, 0.55f) };
-        dim.SetAnchorsPreset(Control.LayoutPreset.FullRect);
-        _menuLayer.AddChild(dim);
-
-        var center = new CenterContainer();
-        center.SetAnchorsPreset(Control.LayoutPreset.FullRect);
-        _menuLayer.AddChild(center);
-
-        var panel = new PanelContainer();
-        center.AddChild(panel);
-
-        var margin = new MarginContainer();
-        foreach (var side in new[] { "left", "right", "top", "bottom" })
-            margin.AddThemeConstantOverride($"margin_{side}", 28);
-        panel.AddChild(margin);
-
-        var vbox = new VBoxContainer();
-        vbox.AddThemeConstantOverride("separation", 12);
-        margin.AddChild(vbox);
-
-        var title = new Label { Text = "LAST GUARDIAN STANDING", HorizontalAlignment = HorizontalAlignment.Center };
-        title.AddThemeFontSizeOverride("font_size", 44);
-        title.AddThemeColorOverride("font_color", TeamColors[0]);
-        vbox.AddChild(title);
-        vbox.AddChild(new Label { Text = "Four-way paddle ball — local prototype", HorizontalAlignment = HorizontalAlignment.Center });
-        vbox.AddChild(new HSeparator());
-
-        var grid = new GridContainer { Columns = 2 };
-        grid.AddThemeConstantOverride("h_separation", 24);
-        grid.AddThemeConstantOverride("v_separation", 8);
-        vbox.AddChild(grid);
-
-        _teamMode = AddOption(grid, "Teams", (int)_config.TeamMode, "Free-for-all (1v1v1v1)", "2 v 2", "1 v 1 v 2", "1 v 3");
-        _layout = AddOption(grid, "Team layout", (int)_config.Layout, "Random", "Side by side", "Facing each other");
-        _livesMode = AddOption(grid, "Lives", (int)_config.LivesMode, "Personal", "Shared per team");
-        _ballMode = AddOption(grid, "Balls", (int)_config.BallMode, "Single", "Chaos");
-        _lives = AddSpin(grid, "Lives each", 1, 20, _config.Lives);
-        _rounds = AddSpin(grid, "Rounds to win", 1, 9, _config.RoundsToWin);
-        _maxBalls = AddSpin(grid, "Max balls (chaos)", 2, 10, _config.MaxBalls);
-
-        vbox.AddChild(new HSeparator());
-        var players = new GridContainer { Columns = 2 };
-        players.AddThemeConstantOverride("h_separation", 24);
-        players.AddThemeConstantOverride("v_separation", 8);
-        vbox.AddChild(players);
-        for (int i = 0; i < 4; i++)
-            _slots[i] = AddOption(players, $"{SideNames[i]}   ({KeyHints[i]})", (int)_config.Slots[i], "Empty", "Human", "Bot");
-
-        vbox.AddChild(new HSeparator());
-        var start = new Button { Text = "Start match", CustomMinimumSize = new Vector2(0, 44) };
-        start.Pressed += () => StartMatch(fromMenu: true);
-        vbox.AddChild(start);
-        vbox.AddChild(new Label
+        int port = _menu.Port;
+        var err = _net.Host(port);
+        if (err != Error.Ok)
         {
-            Text = "Esc: back to menu.",
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Modulate = new Color(1, 1, 1, 0.6f),
-        });
-    }
-
-    static OptionButton AddOption(GridContainer grid, string label, int selected, params string[] items)
-    {
-        grid.AddChild(new Label { Text = label });
-        var ob = new OptionButton { CustomMinimumSize = new Vector2(240, 0) };
-        foreach (var item in items) ob.AddItem(item);
-        ob.Selected = selected;
-        grid.AddChild(ob);
-        return ob;
-    }
-
-    static SpinBox AddSpin(GridContainer grid, string label, int min, int max, int value)
-    {
-        grid.AddChild(new Label { Text = label });
-        var sb = new SpinBox { MinValue = min, MaxValue = max, Value = value, Step = 1 };
-        grid.AddChild(sb);
-        return sb;
-    }
-
-    // ------------------------------------------------------------------ drawing
-
-    public override void _Draw()
-    {
-        DrawArena();
-        if (_sim == null) return;
-
-        DrawBalls();
-        DrawPaddles();
-        DrawHud();
-    }
-
-    void DrawArena()
-    {
-        DrawColoredPolygon(_arenaPolygon, new Color(0.055f, 0.06f, 0.1f));
-
-        var faint = new Color(1, 1, 1, 0.05f);
-        DrawArc(Vector2.Zero, 90f, 0f, Mathf.Tau, 64, faint, 2f, true);
-        DrawLine(new Vector2(-Arena.Half, 0), new Vector2(Arena.Half, 0), faint, 2f);
-        DrawLine(new Vector2(0, -Arena.Half), new Vector2(0, Arena.Half), faint, 2f);
-
-        // Corner posts.
-        var postColor = Glow(new Color(0.85f, 0.88f, 1f), 1.3f);
-        float[] arcStart = { Mathf.Pi / 2f, Mathf.Pi, Mathf.Pi * 1.5f, 0f }; // NW NE SE SW
-        for (int k = 0; k < 4; k++)
-            DrawArc(G(Arena.Corners[k]), Arena.CornerRadius, arcStart[k], arcStart[k] - Mathf.Pi / 2f, 40, postColor, 5f, true);
-
-        // Goal lines / walls.
-        for (int i = 0; i < 4; i++)
-        {
-            var side = (GoalSide)i;
-            var mid = G(Arena.LineCenter(side));
-            var tan = G(Arena.Tangent(side));
-            var a = mid - tan * Arena.GoalHalfWidth;
-            var b = mid + tan * Arena.GoalHalfWidth;
-
-            var player = _sim?.Players[i];
-            bool isWall = player == null || !player.IsActive;
-            Color color;
-            float width;
-            if (isWall)
-            {
-                color = player == null ? new Color(1, 1, 1, 0.25f) : new Color(0.7f, 0.72f, 0.8f);
-                width = 6f;
-            }
-            else
-            {
-                var team = TeamColors[player!.Team % TeamColors.Length];
-                color = new Color(team, 0.35f + 0.1f * MathF.Sin(_time * 3f));
-                width = 3f;
-            }
-
-            if (_goalFlash[i] > 0f)
-            {
-                color = Glow(new Color(1, 1, 1), 1f + _goalFlash[i] * 1.5f);
-                width = 4f + _goalFlash[i] * 8f;
-            }
-            DrawLine(a, b, color, width, true);
-        }
-    }
-
-    void DrawBalls()
-    {
-        foreach (var (_, trail) in _trails)
-        {
-            for (int i = 0; i < trail.Count; i++)
-            {
-                float t = (i + 1) / (float)trail.Count;
-                DrawCircle(trail[i], Arena.BallRadius * t * 0.9f, new Color(1f, 0.95f, 0.8f, t * 0.35f));
-            }
+            _menu.ShowMain($"Couldn't host on port {port} ({err}). Is another copy already hosting?");
+            return;
         }
 
-        foreach (var b in _sim!.Balls)
-        {
-            var pos = G(b.Pos);
-            if (!b.IsLive)
-            {
-                // "Dropping in" telegraph: a ring closing in on the spawn point.
-                float total = _sim.Config.BallMode == BallMode.Single ? Simulation.SingleSpawnDelay : Simulation.ChaosSpawnDelay;
-                float t = Mathf.Clamp(b.SpawnTimer / total, 0f, 1f);
-                DrawArc(pos, Arena.BallRadius + t * 40f, 0f, Mathf.Tau, 32, Glow(new Color(1f, 0.9f, 0.6f), 1.5f) with { A = 1f - t * 0.6f }, 3f, true);
-                DrawCircle(pos, Arena.BallRadius * (1f - t) , new Color(1f, 0.95f, 0.8f, 0.6f));
-                continue;
-            }
-
-            var color = b.LastHitter is GoalSide s
-                ? TeamColors[_sim.Players[(int)s].Team % TeamColors.Length].Lerp(Colors.White, 0.55f)
-                : new Color(1f, 0.95f, 0.85f);
-            DrawCircle(pos, Arena.BallRadius, Glow(color, 2.2f));
-        }
+        _mode = Mode.Host;
+        _inMatch = false;
+        _lobby = new LobbyState();
+        _lobby.AddPlayer(_net.MyId, _menu.PlayerName, seat: true);
+        ShowLobby();
     }
 
-    void DrawPaddles()
+    void OnHello(long peerId, string name, int version)
     {
-        foreach (var p in _sim!.Players)
+        if (version != Protocol.Version)
         {
-            if (!p.IsActive) continue;
-            Arena.PaddleBox(p, out var c, out var ext);
-            var rect = new Rect2(G(c) - G(ext), G(ext) * 2f);
-            var color = TeamColors[p.Team % TeamColors.Length];
-            DrawRect(rect, Glow(color, 1.8f));
-            DrawRect(rect.Grow(-3f), Glow(color.Lerp(Colors.White, 0.5f), 2.2f));
+            _net.Kick(peerId, $"Version mismatch (host v{Protocol.Version}, you v{version}). Update your game.");
+            return;
         }
+        if (_lobby.Players.Count >= 4)
+        {
+            _net.Kick(peerId, "The lobby is full.");
+            return;
+        }
+
+        // Joining mid-match: watch now, play from the next match.
+        _lobby.AddPlayer(peerId, name, seat: !_inMatch);
+        BroadcastLobby();
+        RefreshLobbyOrLabels();
     }
 
-    void DrawHud()
+    void OnPeerLeft(long peerId)
     {
-        var sim = _sim!;
-        bool sharedLives = sim.Config.LivesMode == LivesMode.TeamPool && sim.Config.TeamMode != TeamMode.FreeForAll;
+        int side = _lobby.SideOf(peerId);
+        _lobby.RemovePlayer(peerId);
+        if (_inMatch && side >= 0)
+            _sim?.ConvertToBot((GoalSide)side);
+        BroadcastLobby();
+        RefreshLobbyOrLabels();
+    }
 
-        // Per-side labels outside the arena.
-        Vector2[] anchors =
+    void OnRemoteInput(long peerId, float lateral)
+    {
+        if (!_inMatch || _sim == null) return;
+        int side = _lobby.SideOf(peerId);
+        if (side >= 0 && _sim.Players[side].Kind == ControllerKind.Human)
+            _sim.SetTargetLateral((GoalSide)side, lateral);
+    }
+
+    void OnLobbySettingsEdited()
+    {
+        if (_mode != Mode.Host || _inMatch) return;
+        _menu.ReadLobbySettings(_lobby);
+        BroadcastLobby();
+    }
+
+    void OnLobbySlotEdited(int side, int index)
+    {
+        if (_mode != Mode.Host || _inMatch) return;
+        long owner = index switch
         {
-            new(0, -Arena.Half - 62), new(Arena.Half + 150, -12), new(0, Arena.Half + 48), new(-Arena.Half - 150, -12),
+            0 => LobbyState.EmptySide,
+            1 => LobbyState.BotSide,
+            _ when index - 2 < _lobby.Players.Count => _lobby.Players[index - 2].PeerId,
+            _ => LobbyState.BotSide,
         };
+        _lobby.Assign(side, owner);
+        BroadcastLobby();
+        ShowLobby();
+    }
+
+    void StartOnlineMatch()
+    {
+        if (_mode != Mode.Host) return;
+
+        _sim = new Simulation(_lobby.ToConfig());
+        _matchId++;
+        _inMatch = true;
+        _lobby.InMatch = true;
+        _pendingEvents.Clear();
+        _tickCounter = 0;
+        _mySide = _lobby.SideOf(_net.MyId);
+
+        BroadcastLobby();
+        _net.SendMatchStart(_matchId);
+        ConfigureOnlineView(resetEffects: true);
+        HideMenu();
+    }
+
+    void ReturnToLobby()
+    {
+        _inMatch = false;
+        _sim = null;
+        _state = null;
+        _lobby.InMatch = false;
+        _net.SendReturnToLobby();
+        BroadcastLobby();
+        ShowLobby();
+    }
+
+    void BroadcastLobby() => _net.SendLobby(_lobby.Serialize());
+
+    // ------------------------------------------------------------------ joining
+
+    void JoinGame()
+    {
+        string address = _menu.Address;
+        int port = _menu.Port;
+        if (address.Length == 0)
+        {
+            _menu.ShowMain("Type the host's address first.");
+            return;
+        }
+
+        var err = _net.Join(address, port);
+        if (err != Error.Ok)
+        {
+            _menu.ShowMain($"Couldn't start connecting ({err}).");
+            return;
+        }
+
+        _mode = Mode.Client;
+        _inMatch = false;
+        _lobby = new LobbyState();
+        _menu.ShowMain($"Connecting to {address}:{port}…", busy: true);
+    }
+
+    void OnLobbyReceived(byte[] data)
+    {
+        if (_mode != Mode.Client || LobbyState.Deserialize(data) is not { } lobby) return;
+        _lobby = lobby;
+        _mySide = _lobby.SideOf(_net.MyId);
+        RefreshLobbyOrLabels();
+    }
+
+    void EnterClientMatch(int matchId)
+    {
+        if (_mode != Mode.Client) return;
+        if (_inMatch && matchId == _buffer.MatchId) return;
+
+        _inMatch = true;
+        _buffer.Reset(matchId);
+        _state = null;
+        _myLateral = 0f;
+        _myRound = -1;
+        _tickCounter = 0;
+        _mySide = _lobby.SideOf(_net.MyId);
+        ConfigureOnlineView(resetEffects: true);
+        HideMenu();
+    }
+
+    void OnSnapshotReceived(byte[] data)
+    {
+        if (_mode != Mode.Client || GameState.Deserialize(data) is not { } s) return;
+        if (!_inMatch || s.MatchId > _buffer.MatchId)
+            EnterClientMatch(s.MatchId); // also covers joining mid-match and a missed start message
+        _buffer.Add(s);
+    }
+
+    void OnReturnToLobbyReceived()
+    {
+        if (_mode != Mode.Client) return;
+        _inMatch = false;
+        _state = null;
+        ShowLobby();
+    }
+
+    // ------------------------------------------------------------------ shared online helpers
+
+    void LeaveOnline(string reason)
+    {
+        _net.Leave();
+        _mode = Mode.Menu;
+        _inMatch = false;
+        _sim = null;
+        _state = null;
+        _mySide = -1;
+        _lobby = new LobbyState();
+        _buffer.Reset(-1);
+        _menu.ShowMain(reason);
+    }
+
+    void ShowLobby()
+    {
+        bool isHost = _mode == Mode.Host;
+        string status = isHost
+            ? $"Hosting on port {_menu.Port}. Friends join with your IP address and that port."
+            : "Waiting for the host to start the match…";
+        _menu.ShowLobby(_lobby, isHost, _net.MyId, status);
+    }
+
+    void RefreshLobbyOrLabels()
+    {
+        if (_inMatch) ConfigureOnlineView(resetEffects: false);
+        else ShowLobby();
+    }
+
+    void ConfigureOnlineView(bool resetEffects)
+    {
+        long me = _net.MyId;
+        _view.MySide = _mySide;
+        _view.ViewRotation = RotationFor(_mySide);
         for (int i = 0; i < 4; i++)
         {
-            var p = sim.Players[i];
-            var anchor = anchors[i];
-            if (p.Kind == ControllerKind.Empty)
-            {
-                DrawText(anchor, "— empty —", 18, new Color(1, 1, 1, 0.3f));
-                continue;
-            }
-
-            var color = TeamColors[p.Team % TeamColors.Length];
-            string who = p.Kind == ControllerKind.Human ? $"{SideNames[i]} · {KeyHints[i]}" : $"{SideNames[i]} · BOT";
-            DrawText(anchor, who, 20, p.Eliminated ? new Color(1, 1, 1, 0.35f) : color);
-
-            if (p.Eliminated)
-            {
-                DrawText(anchor + new Vector2(0, 26), "KNOCKED OUT", 18, new Color(1f, 0.4f, 0.4f, 0.8f));
-                continue;
-            }
-
-            int lives = sharedLives ? sim.Teams[p.Team].Lives : p.Lives;
-            int max = sharedLives ? sim.Config.Lives * Math.Max(1, sim.Teams[p.Team].Members.Count) : sim.Config.Lives;
-            if (max <= 12)
-            {
-                float spacing = 16f;
-                float x0 = anchor.X - (max - 1) * spacing / 2f;
-                for (int l = 0; l < max; l++)
-                {
-                    var pip = new Vector2(x0 + l * spacing, anchor.Y + 20);
-                    if (l < lives) DrawCircle(pip, 5f, Glow(color, 1.5f));
-                    else DrawArc(pip, 5f, 0, Mathf.Tau, 16, new Color(color, 0.4f), 1.5f, true);
-                }
-            }
-            else
-            {
-                DrawText(anchor + new Vector2(0, 26), $"{lives} lives", 18, color);
-            }
+            long owner = _lobby.SideOwner[i];
+            string name = owner > 0 ? _lobby.NameOf(owner) : $"Bot ({ArenaView.SideNames[i]})";
+            _view.DisplayNames[i] = name;
+            _view.SideLabels[i] = owner > 0 ? (owner == me ? $"{name} (you)" : name) : "BOT";
         }
+        _view.MatchOverHint = _mode == Mode.Host ? "Space: lobby     R: rematch" : "Waiting for the host…";
+        if (resetEffects) _view.ResetEffects();
+    }
 
-        // Scoreboard.
-        var board = new Vector2(-Arena.Half - 420, -Arena.Half + 10);
-        DrawString(_font, board, $"ROUND {sim.Round}", HorizontalAlignment.Left, -1, 26, Colors.White);
-        int row = 1;
-        foreach (var t in sim.Teams.Where(t => t.Members.Count > 0))
+    /// <summary>Rotation that puts <paramref name="side"/>'s goal at the bottom of the screen.</summary>
+    static float RotationFor(int side) => side switch
+    {
+        (int)GoalSide.North => Mathf.Pi,
+        (int)GoalSide.East => Mathf.Pi / 2f,
+        (int)GoalSide.West => -Mathf.Pi / 2f,
+        _ => 0f,
+    };
+
+    void HideMenu()
+    {
+        _menu.Visible = false;
+        GetViewport().GuiReleaseFocus();
+    }
+
+    // ------------------------------------------------------------------ command line
+
+    /// <summary>
+    /// Options after "--" on the command line, mainly for testing:
+    /// --demo, --name N, --port P, --host, --join ADDRESS, --autostart SECONDS, --screenshot PATH, --screenshot-at SECONDS
+    /// </summary>
+    void HandleCommandLine()
+    {
+        var args = OS.GetCmdlineUserArgs();
+        string? Arg(string name)
         {
-            var color = TeamColors[t.Id % TeamColors.Length];
-            var pos = board + new Vector2(0, row * 34);
-            DrawString(_font, pos, TeamLabel(t.Id), HorizontalAlignment.Left, -1, 20, color);
-            for (int w = 0; w < sim.Config.RoundsToWin; w++)
-            {
-                var pip = pos + new Vector2(170 + w * 22, -7);
-                if (w < t.RoundWins) DrawCircle(pip, 7f, Glow(color, 1.6f));
-                else DrawArc(pip, 7f, 0, Mathf.Tau, 16, new Color(color, 0.5f), 2f, true);
-            }
-            row++;
+            int i = Array.IndexOf(args, name);
+            return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
         }
+        double Seconds(string? s, double fallback) =>
+            double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : fallback;
 
-        var footer = new Vector2(-Arena.Half - 420, Arena.Half - 10);
-        DrawString(_font, footer, ModeSummary(sim), HorizontalAlignment.Left, 380, 16, new Color(1, 1, 1, 0.5f));
-        if (sim.IsPractice)
-            DrawString(_font, footer + new Vector2(0, -26), "PRACTICE — rounds need two teams", HorizontalAlignment.Left, -1, 16, new Color(1f, 0.8f, 0.3f, 0.8f));
-
-        // Center message.
-        switch (sim.Phase)
+        if (Arg("--name") is { } name) _menu.SetPlayerName(name);
+        if (Arg("--port") is { } port && int.TryParse(port, out var p)) _menu.SetPort(p);
+        if (Arg("--screenshot") is { } shot)
         {
-            case MatchPhase.Countdown:
-                DrawBig($"ROUND {sim.Round}", -40, 30, Colors.White);
-                DrawBig(Mathf.CeilToInt(sim.PhaseTimer).ToString(), 30, 72, Glow(Colors.White, 1.4f));
-                break;
-            case MatchPhase.RoundOver:
-                DrawBig(sim.RoundWinner >= 0 ? $"{TeamLabel(sim.RoundWinner)} takes the round" : "Round over", 0, 40,
-                    sim.RoundWinner >= 0 ? Glow(TeamColors[sim.RoundWinner % TeamColors.Length], 1.5f) : Colors.White);
-                break;
-            case MatchPhase.MatchOver:
-                DrawBig($"{TeamLabel(sim.MatchWinner)} wins the match!", -20, 46, Glow(TeamColors[sim.MatchWinner % TeamColors.Length], 1.6f));
-                DrawBig("Space: menu     R: rematch", 30, 22, new Color(1, 1, 1, 0.8f));
-                break;
+            _screenshotPath = shot;
+            _screenshotAt = Seconds(Arg("--screenshot-at"), 8);
+        }
+        if (Arg("--autostart") is { } auto) _autostartAt = Seconds(auto, 3);
+
+        if (args.Contains("--demo"))
+        {
+            for (int i = 0; i < 4; i++) _localConfig.Slots[i] = ControllerKind.Bot;
+            _localConfig.BallMode = BallMode.Chaos;
+            _localConfig.TeamMode = TeamMode.TwoVsTwo;
+            StartLocal();
+        }
+        else if (args.Contains("--host"))
+        {
+            HostGame();
+        }
+        else if (Arg("--join") is { } address)
+        {
+            _menu.SetAddress(address);
+            JoinGame();
         }
     }
-
-    string TeamLabel(int team)
-    {
-        // In free-for-all, team id == side index.
-        if (_sim!.Config.TeamMode == TeamMode.FreeForAll)
-            return SideNames[team];
-        return $"Team {TeamNames[team % TeamNames.Length]}";
-    }
-
-    static string ModeSummary(Simulation sim)
-    {
-        string teams = sim.Config.TeamMode switch
-        {
-            TeamMode.TwoVsTwo => "2v2",
-            TeamMode.OneOneTwo => "1v1v2",
-            TeamMode.OneVsThree => "1v3",
-            _ => "Free-for-all",
-        };
-        string layout = sim.Config.TeamMode is TeamMode.TwoVsTwo or TeamMode.OneOneTwo
-            ? (sim.ResolvedLayout == TeamLayout.Adjacent ? " · side by side" : " · facing") : "";
-        string lives = sim.Config.LivesMode == LivesMode.TeamPool && sim.Config.TeamMode != TeamMode.FreeForAll ? "shared lives" : "personal lives";
-        string balls = sim.Config.BallMode == BallMode.Chaos ? $"chaos ({sim.MaxBalls} balls)" : "single ball";
-        return $"{teams}{layout} · {lives} · {balls}";
-    }
-
-    void DrawText(Vector2 center, string text, int size, Color color) =>
-        DrawString(_font, center - new Vector2(150, 0), text, HorizontalAlignment.Center, 300, size, color);
-
-    void DrawBig(string text, float y, int size, Color color)
-    {
-        var pos = new Vector2(-Arena.Half, y);
-        DrawString(_font, pos + new Vector2(3, 3), text, HorizontalAlignment.Center, Arena.Half * 2, size, new Color(0, 0, 0, 0.7f));
-        DrawString(_font, pos, text, HorizontalAlignment.Center, Arena.Half * 2, size, color);
-    }
-
-    // ------------------------------------------------------------------ helpers
-
-    static Vector2[] BuildArenaPolygon()
-    {
-        // Walk clockwise: each corner arc runs from a0 to a0 - 90°, joined by the straight goal lines.
-        var points = new List<Vector2>();
-        (int corner, float a0)[] order =
-        {
-            (1, Mathf.Pi), (2, Mathf.Pi * 1.5f), (3, 0f), (0, Mathf.Pi / 2f), // NE SE SW NW
-        };
-        const int segments = 24;
-        foreach (var (corner, a0) in order)
-        {
-            var c = G(Arena.Corners[corner]);
-            for (int s = 0; s <= segments; s++)
-            {
-                float a = a0 - Mathf.Pi / 2f * s / segments;
-                points.Add(c + new Vector2(Mathf.Cos(a), Mathf.Sin(a)) * Arena.CornerRadius);
-            }
-        }
-        return points.ToArray();
-    }
-
-    static Color Glow(Color c, float k) => new(c.R * k, c.G * k, c.B * k, c.A);
-
-    static Vector2 G(NVec v) => new(v.X, v.Y);
 }
