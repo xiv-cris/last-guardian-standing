@@ -2,10 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Godot;
-using Quadra.Sim;
+using LastGuardianStanding.Sim;
 using NVec = System.Numerics.Vector2;
 
-namespace Quadra.Game;
+namespace LastGuardianStanding.Game;
 
 /// <summary>
 /// Local prototype front-end: owns a <see cref="Simulation"/>, feeds it keyboard input, and draws it.
@@ -207,8 +207,8 @@ public partial class Main : Node2D
         vbox.AddThemeConstantOverride("separation", 12);
         margin.AddChild(vbox);
 
-        var title = new Label { Text = "QUADRA", HorizontalAlignment = HorizontalAlignment.Center };
-        title.AddThemeFontSizeOverride("font_size", 52);
+        var title = new Label { Text = "LAST GUARDIAN STANDING", HorizontalAlignment = HorizontalAlignment.Center };
+        title.AddThemeFontSizeOverride("font_size", 44);
         title.AddThemeColorOverride("font_color", TeamColors[0]);
         vbox.AddChild(title);
         vbox.AddChild(new Label { Text = "Four-way paddle ball — local prototype", HorizontalAlignment = HorizontalAlignment.Center });

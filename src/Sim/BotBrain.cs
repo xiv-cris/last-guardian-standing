@@ -1,7 +1,7 @@
 using System;
 using System.Numerics;
 
-namespace Quadra.Sim;
+namespace LastGuardianStanding.Sim;
 
 /// <summary>Simple paddle AI: guard against the ball that will reach our line soonest, with some human-ish error.</summary>
 public static class BotBrain

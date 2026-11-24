@@ -1,6 +1,6 @@
 using System.Numerics;
 
-namespace Quadra.Sim;
+namespace LastGuardianStanding.Sim;
 
 /// <summary>The four goal sides, clockwise from the top. World space is y-down (same as Godot).</summary>
 public enum GoalSide { North = 0, East = 1, South = 2, West = 3 }

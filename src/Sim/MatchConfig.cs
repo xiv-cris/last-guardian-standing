@@ -1,7 +1,7 @@
 using System;
 using System.Linq;
 
-namespace Quadra.Sim;
+namespace LastGuardianStanding.Sim;
 
 public enum ControllerKind { Empty, Human, Bot }
 public enum TeamMode { FreeForAll, TwoVsTwo, OneOneTwo, OneVsThree }

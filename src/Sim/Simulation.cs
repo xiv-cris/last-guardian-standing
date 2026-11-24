@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 
-namespace Quadra.Sim;
+namespace LastGuardianStanding.Sim;
 
 /// <summary>
 /// The whole game, with no engine dependency. Feed it intents, call <see cref="Step"/> at a fixed rate,

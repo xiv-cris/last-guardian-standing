@@ -1,7 +1,7 @@
 using System.Collections.Generic;
 using System.Numerics;
 
-namespace Quadra.Sim;
+namespace LastGuardianStanding.Sim;
 
 public sealed class Ball
 {

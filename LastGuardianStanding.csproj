@@ -2,7 +2,7 @@
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <EnableDynamicLoading>true</EnableDynamicLoading>
-    <RootNamespace>Quadra</RootNamespace>
+    <RootNamespace>LastGuardianStanding</RootNamespace>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 </Project>

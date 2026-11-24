@@ -1,4 +1,7 @@
-# Quadra
+# Last Guardian Standing
+
+Four guardians, four goals, one survivor. The name nods to the Four Symbols, the guardian
+beasts of the cardinal directions.
 
 Four-way paddle ball, made with Godot 4.6 (.NET / C#). Square arena, one goal per side (N/E/S/W),
 quarter-circle posts in the corners that can't be scored on. Balls drop in from the corners.
