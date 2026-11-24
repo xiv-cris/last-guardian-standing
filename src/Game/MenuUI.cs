@@ -41,6 +41,7 @@ public partial class MenuUI : CanvasLayer
     Button _start = null!, _back = null!;
     bool _refreshing;
 
+    public bool IsOnMainScreen => Visible && _mainPanel.Visible;
     public string PlayerName => LobbyState.CleanName(_name.Text);
     public string Address => _address.Text.Trim();
     public int Port => (int)_port.Value;

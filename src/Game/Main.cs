@@ -37,6 +37,12 @@ public partial class Main : Node2D
     ArenaView _view = null!;
     MenuUI _menu = null!;
     NetSession _net = null!;
+    MatchOverlay _overlay = null!;
+    Camera2D _camera = null!;
+
+    /// <summary>Active touches (and mouse drags, emulated as touch), by finger index, in screen pixels.</summary>
+    readonly Dictionary<int, Vector2> _touches = new();
+    Vector2I _lastWindowSize;
 
     readonly MatchConfig _localConfig = new();
     Simulation? _sim;
@@ -64,8 +70,15 @@ public partial class Main : Node2D
         AddChild(_view);
         _net = new NetSession { Name = "NetSession" };
         AddChild(_net);
+        _overlay = new MatchOverlay { Name = "MatchOverlay", Visible = false };
+        AddChild(_overlay);
         _menu = new MenuUI { Name = "Menu" };
         AddChild(_menu);
+        _camera = GetNode<Camera2D>("Camera2D");
+
+        _overlay.ExitPressed += ExitMatch;
+        _overlay.MenuPressed += ExitMatch;
+        _overlay.RematchPressed += Rematch;
 
         _menu.LocalPressed += () => { _mode = Mode.Local; _menu.ShowLocalSetup(_localConfig); };
         _menu.HostPressed += HostGame;
@@ -97,9 +110,10 @@ public partial class Main : Node2D
         switch (_mode)
         {
             case Mode.Local when _sim != null:
+                var touchIntents = LocalTouchIntents(_sim);
                 for (int i = 0; i < 4; i++)
                     if (_sim.Players[i].Kind == ControllerKind.Human)
-                        _sim.SetIntent((GoalSide)i, ReadSideKeys(i));
+                        _sim.SetIntent((GoalSide)i, touchIntents[i] ?? ReadSideKeys(i));
                 _sim.Step(dt);
                 _view.OnEvents(_sim.Events);
                 _state = GameState.Capture(_sim, _matchId, _sim.Events);
@@ -107,7 +121,7 @@ public partial class Main : Node2D
 
             case Mode.Host when _inMatch && _sim != null:
                 if (_mySide >= 0)
-                    _sim.SetIntent((GoalSide)_mySide, ReadOnlineIntent());
+                    _sim.SetIntent((GoalSide)_mySide, OnlineIntent(_sim.Players[_mySide].Lateral));
                 _sim.Step(dt);
                 _view.OnEvents(_sim.Events);
                 _pendingEvents.AddRange(_sim.Events);
@@ -129,7 +143,7 @@ public partial class Main : Node2D
                     _myLateral = 0f; // the host recenters paddles every round
                 }
                 if (_mySide >= 0 && latest.Players[_mySide].IsActive)
-                    _myLateral = Simulation.StepLateral((GoalSide)_mySide, _myLateral, ReadOnlineIntent(), dt);
+                    _myLateral = Simulation.StepLateral((GoalSide)_mySide, _myLateral, OnlineIntent(_myLateral), dt);
                 if (++_tickCounter % Protocol.SnapshotEveryTicks == 0 && _mySide >= 0)
                     _net.SendInput(_myLateral);
                 break;
@@ -155,6 +169,12 @@ public partial class Main : Node2D
         }
 
         _view.State = _state;
+        UpdateLayout();
+
+        bool playing = _mode == Mode.Local ? _sim != null : _inMatch;
+        _overlay.Visible = playing;
+        _overlay.SetMatchOver(playing && _state?.Phase == MatchPhase.MatchOver);
+        if (!playing) _touches.Clear();
 
         if (_autostartAt >= 0 && _uptime >= _autostartAt && _mode == Mode.Host && !_inMatch)
         {
@@ -170,27 +190,132 @@ public partial class Main : Node2D
         }
     }
 
+    public override void _Input(InputEvent @event)
+    {
+        // Releases are tracked here, before the GUI can swallow them (e.g. lifting a finger over a button).
+        if (@event is InputEventScreenTouch { Pressed: false } up)
+            _touches.Remove(up.Index);
+    }
+
     public override void _UnhandledInput(InputEvent @event)
     {
-        if (@event is not InputEventKey { Pressed: true, Echo: false } key) return;
-        bool matchOver = _state?.Phase == MatchPhase.MatchOver;
+        switch (@event)
+        {
+            case InputEventScreenTouch { Pressed: true } touch:
+                _touches[touch.Index] = touch.Position;
+                return;
+            case InputEventScreenDrag drag:
+                _touches[drag.Index] = drag.Position;
+                return;
+            case InputEventKey { Pressed: true, Echo: false } key:
+                bool matchOver = _state?.Phase == MatchPhase.MatchOver;
+                bool playing = _mode == Mode.Local ? _sim != null : _inMatch;
+                if (!playing) return;
+                if (key.Keycode == Key.Escape) ExitMatch();
+                else if (matchOver && key.Keycode == Key.Space && _mode != Mode.Client) ExitMatch();
+                else if (matchOver && key.Keycode == Key.R) Rematch();
+                return;
+        }
+    }
 
+    /// <summary>Android back button / gesture: behaves like Esc, and quits from the main screen.</summary>
+    public override void _Notification(int what)
+    {
+        if (what != NotificationWMGoBackRequest) return;
+        bool playing = _mode == Mode.Local ? _sim != null : _inMatch;
+        if (playing) ExitMatch();
+        else if (_menu.IsOnMainScreen) GetTree().Quit();
+        else OnBackPressed();
+    }
+
+    /// <summary>Esc / Exit button: local -> setup, host -> lobby for everyone, client -> leave.</summary>
+    void ExitMatch()
+    {
         switch (_mode)
         {
-            case Mode.Local when _sim != null:
-                if (key.Keycode == Key.Escape || (matchOver && key.Keycode == Key.Space)) StopLocal();
-                else if (matchOver && key.Keycode == Key.R) StartLocal();
-                break;
-
-            case Mode.Host when _inMatch:
-                if (key.Keycode == Key.Escape || (matchOver && key.Keycode == Key.Space)) ReturnToLobby();
-                else if (matchOver && key.Keycode == Key.R) StartOnlineMatch();
-                break;
-
-            case Mode.Client when _inMatch:
-                if (key.Keycode == Key.Escape) LeaveOnline("You left the game.");
-                break;
+            case Mode.Local when _sim != null: StopLocal(); break;
+            case Mode.Host when _inMatch: ReturnToLobby(); break;
+            case Mode.Client when _inMatch: LeaveOnline("You left the game."); break;
         }
+    }
+
+    void Rematch()
+    {
+        if (_state?.Phase != MatchPhase.MatchOver) return;
+        if (_mode == Mode.Local) StartLocal();
+        else if (_mode == Mode.Host) StartOnlineMatch();
+    }
+
+    // ------------------------------------------------------------------ touch
+
+    /// <summary>A screen position turned into arena coordinates (undoing camera and view rotation).</summary>
+    NVec ScreenToArena(Vector2 screen)
+    {
+        var world = GetCanvasTransform().AffineInverse() * screen;
+        var arena = world.Rotated(-_view.ViewRotation);
+        return new NVec(arena.X, arena.Y);
+    }
+
+    /// <summary>Steer a paddle toward the point under a finger, with the same easing the bots use.</summary>
+    static NVec SteerToward(GoalSide side, float lateral, NVec arenaPoint)
+    {
+        var tangent = Arena.Tangent(side);
+        float target = Math.Clamp(NVec.Dot(arenaPoint, tangent), -Arena.PaddleLateralLimit, Arena.PaddleLateralLimit);
+        return tangent * Math.Clamp((target - lateral) / 30f, -1f, 1f);
+    }
+
+    /// <summary>Online: any finger (the newest one) steers our paddle; otherwise the keyboard.</summary>
+    NVec OnlineIntent(float lateral)
+    {
+        if (_mySide >= 0 && _touches.Count > 0)
+            return SteerToward((GoalSide)_mySide, lateral, ScreenToArena(_touches.Values.Last()));
+        return ReadOnlineIntent();
+    }
+
+    /// <summary>Local (shared tablet): each finger steers the human paddle whose goal it is closest to.</summary>
+    NVec?[] LocalTouchIntents(Simulation sim)
+    {
+        var intents = new NVec?[4];
+        foreach (var screen in _touches.Values)
+        {
+            var p = ScreenToArena(screen);
+            int best = -1;
+            float bestDepth = float.MaxValue;
+            for (int i = 0; i < 4; i++)
+            {
+                var player = sim.Players[i];
+                if (player.Kind != ControllerKind.Human || !player.IsActive) continue;
+                var side = (GoalSide)i;
+                float depth = NVec.Dot(p - Arena.LineCenter(side), Arena.Inward(side));
+                if (depth < bestDepth) { bestDepth = depth; best = i; }
+            }
+            if (best >= 0)
+                intents[best] = SteerToward((GoalSide)best, sim.Players[best].Lateral, p);
+        }
+        return intents;
+    }
+
+    // ------------------------------------------------------------------ screen layout
+
+    /// <summary>Zooms the camera so arena + HUD fit any window shape; bigger UI on phones.</summary>
+    void UpdateLayout()
+    {
+        var window = DisplayServer.WindowGetSize();
+        if (window != _lastWindowSize && OS.HasFeature("mobile") && window.X > 0 && window.Y > 0)
+        {
+            _lastWindowSize = window;
+            var baseSize = new Vector2(1600, 1000);
+            float baseScale = Math.Min(window.X / baseSize.X, window.Y / baseSize.Y);
+            var visible = new Vector2(window.X, window.Y) / baseScale;
+            GetTree().Root.ContentScaleFactor = Math.Clamp(Math.Min(visible.X / 720f, visible.Y / 860f), 1f, 2.2f);
+        }
+
+        var size = GetViewportRect().Size;
+        bool portrait = size.Y > size.X;
+        var needed = portrait ? new Vector2(1260, 1480) : new Vector2(1900, 1200);
+        float zoom = Math.Min(size.X / needed.X, size.Y / needed.Y);
+        _camera.Zoom = new Vector2(zoom, zoom);
+        _view.Portrait = portrait;
     }
 
     NVec ReadSideKeys(int side)
@@ -257,6 +382,7 @@ public partial class Main : Node2D
         }
         _view.MatchOverHint = "Space: menu     R: rematch";
         _view.ResetEffects();
+        _overlay.Configure("Menu", "Menu", hostControls: true);
         HideMenu();
     }
 
@@ -485,6 +611,8 @@ public partial class Main : Node2D
         }
         _view.MatchOverHint = _mode == Mode.Host ? "Space: lobby     R: rematch" : "Waiting for the host…";
         if (resetEffects) _view.ResetEffects();
+        if (_mode == Mode.Host) _overlay.Configure("Lobby", "Lobby", hostControls: true);
+        else _overlay.Configure("Leave", "", hostControls: false);
     }
 
     /// <summary>Rotation that puts <paramref name="side"/>'s goal at the bottom of the screen.</summary>
@@ -533,6 +661,8 @@ public partial class Main : Node2D
             for (int i = 0; i < 4; i++) _localConfig.Slots[i] = ControllerKind.Bot;
             _localConfig.BallMode = BallMode.Chaos;
             _localConfig.TeamMode = TeamMode.TwoVsTwo;
+            if (Arg("--lives") is { } l && int.TryParse(l, out var lives)) _localConfig.Lives = Math.Clamp(lives, 1, 20);
+            if (Arg("--rounds") is { } r && int.TryParse(r, out var rounds)) _localConfig.RoundsToWin = Math.Clamp(rounds, 1, 9);
             StartLocal();
         }
         else if (args.Contains("--host"))
