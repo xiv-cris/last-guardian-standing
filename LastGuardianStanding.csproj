@@ -1,6 +1,8 @@
 <Project Sdk="Godot.NET.Sdk/4.6.3">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
+    <!-- Godot's Android export template only supports .NET 9 -->
+    <TargetFramework Condition=" '$(GodotTargetPlatform)' == 'android' ">net9.0</TargetFramework>
     <EnableDynamicLoading>true</EnableDynamicLoading>
     <RootNamespace>LastGuardianStanding</RootNamespace>
     <Nullable>enable</Nullable>

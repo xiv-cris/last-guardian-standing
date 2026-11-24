@@ -27,7 +27,7 @@ Bot-only demo straight from a terminal:
 3. In the lobby the host picks the settings and who defends which side (players, bots or empty),
    then clicks **Start match**. Players who disconnect are replaced by a bot.
 
-Online, everyone sees **their own goal at the bottom** and plays with **← → or A / D**.
+Online, everyone sees **their own goal at the bottom** and plays with **← → or A / D** (or a gamepad).
 Host: `Esc` or `Space` (after a match) returns everyone to the lobby, `R` is a rematch.
 Clients: `Esc` leaves.
 
@@ -35,7 +35,10 @@ Testing on one PC: run two copies, host in one, join `127.0.0.1` in the other.
 Over the internet the host must be reachable: forward the port on the router, or use a
 virtual LAN such as Tailscale and join with the host's Tailscale IP.
 
-## Controls (local match)
+## Controls
+
+All keys can be changed in **Controls & gamepads** on the main screen (saved per computer in
+`user://controls.cfg`). Defaults for a local match:
 
 | Side  | Keys            |
 |-------|-----------------|
@@ -47,6 +50,21 @@ virtual LAN such as Tailscale and join with the host's Tailscale IP.
 Keys are screen directions: North/South paddles use left/right, East/West use up/down.
 Paddles slide along their goal line only. `Esc` returns to the menu.
 
+`P` pauses a local match (online games can't be paused, they keep running for everyone).
+
+**Gamepads:** left stick or d-pad moves, `Start` pauses a local match, `Back` (PlayStation: Create)
+leaves, and once a match is over `Start` is a rematch and `B` (Circle) goes back to the menu.
+In menus the d-pad / stick moves, `A` (Cross) presses, `B` (Circle) goes back, and left/right change
+dropdowns and numbers in place. Online, any gamepad steers your paddle. In a local match each side's
+gamepad is *Auto* by default: plugged-in pads go to the human sides in turn (South, North, East, West),
+or pin a specific pad to a side on the Controls screen.
+
+## Sound
+
+All audio is synthesized in code at startup, no sound files: a laser zap on every paddle hit
+(`src/Game/Sfx.cs`) and a 30-second looping 128 BPM battle track (`src/Game/Music.cs`).
+Music can be switched off on the main screen; the choice is saved.
+
 ## Command-line options (for testing)
 
 Pass them after `--`, e.g. `Godot.exe --path . -- --host --name Cris --autostart 3`.
@@ -54,6 +72,7 @@ Pass them after `--`, e.g. `Godot.exe --path . -- --host --name Cris --autostart
 | Option | Effect |
 |---|---|
 | `--demo` | All-bot local chaos match |
+| `--controls` | Open the Controls screen |
 | `--name N`, `--port P` | Pre-fill name / port |
 | `--host` / `--join ADDRESS` | Host or join straight away |
 | `--autostart S` | Host: start the match after S seconds |

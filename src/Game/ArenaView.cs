@@ -39,6 +39,12 @@ public partial class ArenaView : Node2D
 
     public string MatchOverHint { get; set; } = "";
 
+    /// <summary>Non-null while a local match is paused: drawn under "PAUSED".</summary>
+    public string? PausedHint { get; set; }
+
+    /// <summary>Tall screen: scoreboard goes above the arena, side labels squeeze in.</summary>
+    public bool Portrait { get; set; }
+
     readonly Dictionary<int, List<Vector2>> _trails = new();
     readonly float[] _goalFlash = new float[4];
     float _shake;
@@ -232,18 +238,22 @@ public partial class ArenaView : Node2D
         {
             var p = s.Players[i];
             var anchor = ScreenAnchor(i);
+            bool narrow = Portrait && MathF.Abs(anchor.X) > 1f; // left/right labels on a tall screen
+            float width = narrow ? 180f : 300f;
+            int small = narrow ? 15 : 18;
             if (p.Kind == ControllerKind.Empty)
             {
-                DrawText(anchor, "— empty —", 18, new Color(1, 1, 1, 0.3f));
+                DrawText(anchor, "— empty —", small, new Color(1, 1, 1, 0.3f), width);
                 continue;
             }
 
             var color = TeamColor(p.Team);
-            DrawText(anchor, SideLabels[i], i == MySide ? 22 : 20, p.Eliminated ? new Color(1, 1, 1, 0.35f) : color);
+            DrawText(anchor, SideLabels[i], (i == MySide ? 22 : 20) - (narrow ? 4 : 0),
+                p.Eliminated ? new Color(1, 1, 1, 0.35f) : color, width);
 
             if (p.Eliminated)
             {
-                DrawText(anchor + new Vector2(0, 26), "KNOCKED OUT", 18, new Color(1f, 0.4f, 0.4f, 0.8f));
+                DrawText(anchor + new Vector2(0, 26), "KNOCKED OUT", small, new Color(1f, 0.4f, 0.4f, 0.8f), width);
                 continue;
             }
 
@@ -251,7 +261,7 @@ public partial class ArenaView : Node2D
             int max = s.SharedLives ? s.Lives * Math.Max(1, s.Teams[p.Team].MemberCount) : s.Lives;
             if (max <= 12)
             {
-                const float spacing = 16f;
+                float spacing = narrow ? 12f : 16f;
                 float x0 = anchor.X - (max - 1) * spacing / 2f;
                 for (int l = 0; l < max; l++)
                 {
@@ -262,12 +272,12 @@ public partial class ArenaView : Node2D
             }
             else
             {
-                DrawText(anchor + new Vector2(0, 26), $"{lives} lives", 18, color);
+                DrawText(anchor + new Vector2(0, 26), $"{lives} lives", small, color, width);
             }
         }
 
-        // Scoreboard.
-        var board = new Vector2(-Arena.Half - 420, -Arena.Half + 10);
+        // Scoreboard: beside the arena on wide screens, above it on tall ones.
+        var board = Portrait ? new Vector2(-600, -Arena.Half - 250) : new Vector2(-Arena.Half - 420, -Arena.Half + 10);
         DrawString(_font, board, $"ROUND {s.Round}", HorizontalAlignment.Left, -1, 26, Colors.White);
         int row = 1;
         for (int t = 0; t < s.Teams.Length; t++)
@@ -285,7 +295,7 @@ public partial class ArenaView : Node2D
             row++;
         }
 
-        var footer = new Vector2(-Arena.Half - 420, Arena.Half - 10);
+        var footer = Portrait ? new Vector2(-600, Arena.Half + 130) : new Vector2(-Arena.Half - 420, Arena.Half - 10);
         DrawString(_font, footer, ModeSummary(s), HorizontalAlignment.Left, 380, 16, new Color(1, 1, 1, 0.5f));
         if (s.IsPractice)
             DrawString(_font, footer + new Vector2(0, -26), "PRACTICE — rounds need two teams", HorizontalAlignment.Left, -1, 16, new Color(1f, 0.8f, 0.3f, 0.8f));
@@ -305,6 +315,12 @@ public partial class ArenaView : Node2D
                 DrawBig(MatchOverHint, 30, 22, new Color(1, 1, 1, 0.8f));
                 break;
         }
+
+        if (PausedHint != null)
+        {
+            DrawBig("PAUSED", 120, 56, Glow(Colors.White, 1.4f));
+            DrawBig(PausedHint, 165, 22, new Color(1, 1, 1, 0.8f));
+        }
     }
 
     /// <summary>Where a side's label goes on screen, after rotation: just outside its goal.</summary>
@@ -313,7 +329,8 @@ public partial class ArenaView : Node2D
         var outward = -G(Arena.Inward((GoalSide)side)).Rotated(ViewRotation);
         if (outward.Y < -0.5f) return new Vector2(0, -Arena.Half - 62);
         if (outward.Y > 0.5f) return new Vector2(0, Arena.Half + 48);
-        return outward.X > 0 ? new Vector2(Arena.Half + 150, -12) : new Vector2(-Arena.Half - 150, -12);
+        float x = Portrait ? Arena.Half + 95 : Arena.Half + 150;
+        return outward.X > 0 ? new Vector2(x, -12) : new Vector2(-x, -12);
     }
 
     string TeamLabel(GameState s, int team)
@@ -340,8 +357,8 @@ public partial class ArenaView : Node2D
         return $"{teams}{layout} · {lives} · {balls}";
     }
 
-    void DrawText(Vector2 center, string text, int size, Color color) =>
-        DrawString(_font, center - new Vector2(150, 0), text, HorizontalAlignment.Center, 300, size, color);
+    void DrawText(Vector2 center, string text, int size, Color color, float width = 300f) =>
+        DrawString(_font, center - new Vector2(width / 2f, 0), text, HorizontalAlignment.Center, width, size, color);
 
     void DrawBig(string text, float y, int size, Color color)
     {
